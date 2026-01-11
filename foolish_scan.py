@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """
-[One Port, One Report] - Foolish Scan v2.3 (Final Gold Master)
+[One Port, One Report] - Foolish Scan v5.2 (Integrated Edition)
 Author: Foolish-admin
 Co-Author: Context-Aware AI (Gemini)
 License: Authorized Penetration Testing / Lab Use Only
-
-FINAL EVOLUTION v2.3:
-- [NEW] CMS Inference: Detects WordPress/Drupal/Joomla and suggests specialized tools.
-- [NEW] Auto-CVE Promotion: Automatically flags 'VULNERABLE' script results as Critical Vectors.
-- [NEW] NFS Logic: Explicitly handles Port 2049 export enumeration.
-- [NEW] DNS Logic: Detects redirect issues and suggests /etc/hosts modifications.
-- [NEW] Loot Detection: Flags sensitive file extensions in anonymous FTP.
-- [FIX] Windows Context: Restricts EternalBlue/BlueKeep to confirmed Windows hosts.
-- [UX]  Clean Prompts: Standard [y/N] CLI convention for save prompts.
 """
-
 import sys
 import os
 import shutil
@@ -24,10 +14,11 @@ import argparse
 import concurrent.futures
 import json
 import re
+import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Set
-from enum import Enum
+from enum import Enum, IntEnum
 from datetime import datetime
 
 # --- DEPENDENCY CHECK ---
@@ -37,8 +28,9 @@ try:
     from rich.tree import Tree
     from rich.text import Text
     from rich.table import Table
-    from rich.prompt import Confirm
+    from rich.prompt import Confirm, Prompt
     from rich.style import Style
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 except ImportError:
     print("[-] Error: 'rich' library not found.")
     print("[-] Please run: pip install rich")
@@ -56,14 +48,15 @@ class Severity(str, Enum):
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
+    OBJECTIVE = "OBJECTIVE ACHIEVED" 
 
-class FindingCategory(str, Enum):
-    VERSION = "VERSION"
-    ENUM = "ENUM"
-    VULN = "VULN"
-    CONFIG = "CONFIG"
-    AUTH = "AUTH"
-    SYSTEM = "SYSTEM"
+class Priority(IntEnum):
+    WIN_CONDITION = 0   
+    MANDATORY_EXPL = 1  
+    CONFIRMED_VULN = 2  
+    CONFIG_WEAKNESS = 3 
+    ENUMERATION = 4     
+    INFO = 5
 
 class AttackVectorType(str, Enum):
     RCE = "RCE"
@@ -73,6 +66,8 @@ class AttackVectorType(str, Enum):
     KNOWN_EXPLOIT = "KNOWN_EXPLOIT"
     WEB_ATTACK = "WEB_ATTACK"
     CONFIG_ISSUE = "CONFIG_ISSUE"
+    PIVOT = "PIVOT_OPPORTUNITY"
+    ACCESS = "IMMEDIATE_ACCESS"
 
 class ScanStatus(str, Enum):
     PENDING = "PENDING"
@@ -91,6 +86,7 @@ class HostFacts:
     workgroup: str = ""
     is_dc: bool = False
     clock_skew: str = ""
+    filtered_ports: int = 0
 
 @dataclass
 class AttackPath:
@@ -100,6 +96,7 @@ class AttackPath:
     command: str
     tool: str
     confidence: str = "Medium"
+    priority: Priority = Priority.ENUMERATION
 
 @dataclass
 class Service:
@@ -116,7 +113,7 @@ class Service:
 @dataclass
 class Finding:
     title: str
-    category: FindingCategory
+    category: str
     severity: Severity = Severity.INFO
     description: str = ""
 
@@ -135,6 +132,7 @@ class Target:
     ip: str
     ports: Dict[int, Port] = field(default_factory=dict)
     facts: HostFacts = field(default_factory=HostFacts)
+    discovered_creds: List[str] = field(default_factory=list) 
     
     def add_port(self, number: int) -> Port:
         if number not in self.ports: self.ports[number] = Port(number=number)
@@ -157,7 +155,10 @@ class TaskEngine:
             "dns": { "safe": ["default", "dns-recursion"], "aggr": ["dns-zone-transfer"], "timeout": self.TIMEOUT_DEFAULT },
             "mysql": { "safe": ["default", "mysql-info", "mysql-empty-password"], "aggr": ["vulners"], "timeout": self.TIMEOUT_DEFAULT },
             "rdp": { "safe": ["default", "rdp-enum-encryption", "rdp-ntlm-info"], "aggr": ["rdp-vuln-bluekeep"], "timeout": self.TIMEOUT_DEFAULT },
-            "nfs": { "safe": ["default", "nfs-showmount", "nfs-ls"], "aggr": [], "timeout": self.TIMEOUT_DEFAULT }
+            "nfs": { "safe": ["default", "nfs-showmount", "nfs-ls"], "aggr": [], "timeout": self.TIMEOUT_DEFAULT },
+            "snmp": { "safe": ["default", "snmp-interfaces", "snmp-processes", "snmp-netstat"], "aggr": ["snmp-brute"], "timeout": self.TIMEOUT_DEFAULT },
+            "pop3": { "safe": ["default", "pop3-capabilities", "pop3-ntlm-info"], "aggr": [], "timeout": self.TIMEOUT_DEFAULT },
+            "imap": { "safe": ["default", "imap-capabilities", "imap-ntlm-info"], "aggr": [], "timeout": self.TIMEOUT_DEFAULT }
         }
 
     def _infer_service(self, port: int) -> str:
@@ -169,6 +170,9 @@ class TaskEngine:
         if p == 2049: return "nfs"
         if p == 3306: return "mysql"
         if p == 3389: return "rdp"
+        if p == 161: return "snmp"
+        if p in [110, 995]: return "pop3"
+        if p in [143, 993]: return "imap"
         return "default"
 
     def get_task(self, port: int, service_name: str = "unknown", retry_mode: bool = False) -> dict:
@@ -185,6 +189,9 @@ class TaskEngine:
         elif "nfs" in svc: rule_key = "nfs"
         elif "mysql" in svc: rule_key = "mysql"
         elif "rdp" in svc: rule_key = "rdp"
+        elif "snmp" in svc: rule_key = "snmp"
+        elif "pop3" in svc: rule_key = "pop3"
+        elif "imap" in svc: rule_key = "imap"
         elif svc in self.RULES: rule_key = svc
         elif svc == "unknown": rule_key = self._infer_service(port)
 
@@ -222,91 +229,82 @@ class FactNormalizer:
         if 88 in target.ports and 445 in target.ports:
             target.facts.is_dc = True
 
-# --- 3. INFERENCE ENGINE (THE BRAIN) ---
+# --- 3. INFERENCE ENGINE (The Strategist) ---
 
 class InferenceEngine:
     def analyze(self, target: Target):
         for port_num, port in target.ports.items():
             self._analyze_port(target, port)
+        self._analyze_cross_protocol(target)
 
     def _analyze_port(self, target: Target, port: Port):
         svc = port.service.name.lower()
         prod = port.service.product.lower()
-        # Combine all findings into one search space for regex
         f_dump = " ".join([f"{f.title} {f.description}" for f in port.findings]).lower()
 
-        # --- SECTOR A: CRITICAL VULNERABILITY PROMOTION ---
-        # Automatically flag anything Nmap says is definitely vulnerable
-        for f in port.findings:
-            desc_lower = f.description.lower()
-            if "state: vulnerable" in desc_lower or "vulnerable: yes" in desc_lower:
-                # Extract CVE if possible
-                cve_match = re.search(r"cve-\d{4}-\d{4,7}", f.title + f.description, re.IGNORECASE)
-                cve_id = cve_match.group(0).upper() if cve_match else "CONFIRMED"
-                
-                port.attack_paths.append(AttackPath(
-                    f"Confirmed Vulnerability ({cve_id})", 
-                    AttackVectorType.KNOWN_EXPLOIT, 
-                    f"Script '{f.title}' confirmed vulnerability state.", 
-                    "Search exploitdb/metasploit", "ExploitDB", "Critical"
-                ))
+        # --- SECTOR 1: GOAL AWARENESS ---
+        if "root@" in f_dump or "uid=0" in f_dump or "#" in port.service.full_banner():
+            port.attack_paths.append(AttackPath("ROOT SHELL DETECTED", AttackVectorType.ACCESS, "Banner indicates a root shell is already open.", f"nc {target.ip} {port.number}", "Netcat", "Critical", Priority.WIN_CONDITION))
+            return 
 
-        # --- SECTOR B: WEB APPLICATION INTELLIGENCE ---
-        if "http" in svc or port.number in [80, 443, 8080, 8443]:
-            # 1. CMS Detection
-            if "wordpress" in f_dump or "wp-login" in f_dump:
-                port.attack_paths.append(AttackPath("WordPress Detected", AttackVectorType.WEB_ATTACK, "WordPress signature found.", f"wpscan --url http://{target.ip}:{port.number} --enumerate p", "WPScan", "High"))
-            if "drupal" in f_dump or "generator: drupal" in f_dump:
-                port.attack_paths.append(AttackPath("Drupal Detected", AttackVectorType.WEB_ATTACK, "Drupal signature found.", f"droopescan scan drupal -u http://{target.ip}:{port.number}", "Droopescan", "High"))
-            if "joomla" in f_dump:
-                port.attack_paths.append(AttackPath("Joomla Detected", AttackVectorType.WEB_ATTACK, "Joomla signature found.", f"joomscan -u http://{target.ip}:{port.number}", "Joomscan", "High"))
+        if "empty password" in f_dump and ("root" in f_dump or "admin" in f_dump):
+            port.attack_paths.append(AttackPath("Empty Administrative Password", AttackVectorType.ACCESS, "Account allows login with no password.", f"mysql -u root -h {target.ip}", "Client", "Critical", Priority.WIN_CONDITION))
 
-            # 2. Login Portal
+        # --- SECTOR 2: MANDATORY CONTEXT & EXPLOITS ---
+        if (port.number == 445 or "smb" in svc) and target.facts.os_family == "Windows":
+            if any(x in target.facts.os_gen for x in ["7", "2008", "vista"]):
+                port.attack_paths.append(AttackPath("Legacy Windows Exploit (EternalBlue)", AttackVectorType.KNOWN_EXPLOIT, f"OS Context ({target.facts.os_gen}) implies high MS17-010 risk.", f"nmap --script smb-vuln-ms17-010 -p {port.number} {target.ip}", "Nmap", "Critical", Priority.MANDATORY_EXPL))
+
+        if port.number == 7001 or "weblogic" in prod:
+            port.attack_paths.append(AttackPath("WebLogic T3 Deserialization", AttackVectorType.KNOWN_EXPLOIT, "WebLogic port detected. T3 protocol often vulnerable.", f"nmap --script weblogic-t3-info -p {port.number} {target.ip}", "Nmap", "Critical", Priority.MANDATORY_EXPL))
+
+        if "miniserv" in f_dump or "miniserv" in prod:
+            port.attack_paths.append(AttackPath("Webmin MiniServ Vulnerability", AttackVectorType.KNOWN_EXPLOIT, "Webmin detected. Check for Unauth RCE (CVE-2019-15107).", f"nmap --script http-vuln-cve2019-15107 -p {port.number} {target.ip}", "Nmap", "High", Priority.MANDATORY_EXPL))
+
+        # --- SECTOR 3: CMS INTELLIGENCE ---
+        if "http" in svc or port.number in [80, 443, 8080, 8443, 8000, 8180]:
+            if "wordpress" in f_dump or "wp-login" in f_dump or "wp-json" in f_dump:
+                if "wp-json" in f_dump:
+                    port.attack_paths.append(AttackPath("WordPress API User Enum", AttackVectorType.ENUMERATION, "REST API exposed. Enumerate users quietly.", f"nmap --script http-wordpress-users -p {port.number} {target.ip}", "Nmap", "High", Priority.CONFIRMED_VULN))
+                port.attack_paths.append(AttackPath("WordPress Detected", AttackVectorType.WEB_ATTACK, "WordPress signature found.", f"wpscan --url http://{target.ip}:{port.number}", "WPScan", "High", Priority.CONFIRMED_VULN))
+
+            if "drupal" in f_dump:
+                port.attack_paths.append(AttackPath("Drupal Detected", AttackVectorType.WEB_ATTACK, "Drupal signature found.", f"droopescan scan drupal -u http://{target.ip}:{port.number}", "Droopescan", "High", Priority.CONFIRMED_VULN))
+
+            if "bolt" in f_dump or "bolt" in prod:
+                port.attack_paths.append(AttackPath("Bolt CMS Detected", AttackVectorType.KNOWN_EXPLOIT, "Bolt CMS signature found.", "searchsploit bolt cms", "ExploitDB", "High", Priority.CONFIRMED_VULN))
+
+            if "fuel" in f_dump:
+                port.attack_paths.append(AttackPath("Fuel CMS Detected", AttackVectorType.KNOWN_EXPLOIT, "Fuel CMS detected. Check for CVE-2018-16763 RCE.", "searchsploit fuel cms", "ExploitDB", "High", Priority.MANDATORY_EXPL))
+
+            # [FIXED] Updated Tomcat Scripts to standard ones
+            if "apache-coyote" in f_dump or "tomcat" in prod:
+                port.attack_paths.append(AttackPath("Apache Tomcat Manager", AttackVectorType.CRED_THEFT, "Tomcat detected. Check for default creds/AJP.", f"nmap --script http-tomcat-info,ajp-auth -p {port.number} {target.ip}", "Nmap", "High", Priority.CONFIG_WEAKNESS))
+
             if any(x in f_dump for x in ["login", "admin", "signin", "wp-login", "auth"]):
-                port.attack_paths.append(AttackPath("Login Portal Detected", AttackVectorType.CRED_THEFT, "Authentication endpoint exposed.", f"Go to http://{target.ip}:{port.number} and test creds", "Browser", "High"))
+                port.attack_paths.append(AttackPath("Login Portal Detected", AttackVectorType.CRED_THEFT, "Authentication endpoint exposed.", f"Go to http://{target.ip}:{port.number}", "Browser", "High", Priority.CONFIG_WEAKNESS))
 
-            # 3. DNS / Hostname
-            if "did not follow redirect to" in f_dump or ".local" in f_dump:
-                port.attack_paths.append(AttackPath("DNS Configuration Required", AttackVectorType.CONFIG_ISSUE, "Target redirects to a hostname not in DNS.", f"echo '{target.ip} <HOSTNAME>' >> /etc/hosts", "System", "High"))
+            port.attack_paths.append(AttackPath("Web Directory Enumeration", AttackVectorType.ENUMERATION, "Web service detected.", f"gobuster dir -u http://{target.ip}:{port.number} -w common.txt", "Gobuster", "Medium", Priority.ENUMERATION))
 
-            # 4. Standard Enum
-            port.attack_paths.append(AttackPath("Web Directory Enumeration", AttackVectorType.ENUMERATION, "Web service detected.", f"gobuster dir -u http://{target.ip}:{port.number} -w common.txt", "Gobuster", "Medium"))
-            if "robots.txt" in f_dump:
-                port.attack_paths.append(AttackPath("Inspect robots.txt", AttackVectorType.ENUMERATION, "Robots.txt found.", f"curl http://{target.ip}:{port.number}/robots.txt", "curl", "Low"))
-
-        # --- SECTOR C: FILE SYSTEM & DATA EXPOSURE ---
-        # 1. NFS
-        if "nfs" in svc or port.number == 2049:
-            port.attack_paths.append(AttackPath("NFS Export Enumeration", AttackVectorType.ENUMERATION, "NFS Service detected.", f"showmount -e {target.ip}", "System Client", "High"))
-
-        # 2. FTP Loot
+        # --- SECTOR 4: FILE & AUTH SERVICES ---
         if "ftp" in svc:
             if "anonymous ftp login allowed" in f_dump:
-                port.attack_paths.append(AttackPath("Anonymous FTP Access", AttackVectorType.ENUMERATION, "Anonymous login allowed.", f"ftp {target.ip}", "System Client", "High"))
-                # Sensitive Loot Logic
-                if any(ext in f_dump for ext in [".pcap", ".kdbx", ".conf", ".rsa", "id_rsa", ".txt"]):
-                    port.attack_paths.append(AttackPath("Sensitive Data Exposure", AttackVectorType.CRED_THEFT, "Sensitive file extensions detected in FTP listing.", f"wget -r ftp://{target.ip}", "Wget", "Critical"))
-            
-            if "vsftpd 2.3.4" in prod:
-                port.attack_paths.append(AttackPath("vsftpd 2.3.4 Backdoor", AttackVectorType.RCE, "Backdoored FTP version.", "use exploit/unix/ftp/vsftpd_234_backdoor", "Metasploit", "Critical"))
+                port.attack_paths.append(AttackPath("Anonymous FTP Access", AttackVectorType.ENUMERATION, "Read-only access found.", f"ftp {target.ip}", "FTP", "High", Priority.CONFIG_WEAKNESS))
+                if any(ext in f_dump for ext in [".pcap", ".kdbx", ".conf", ".rsa", "id_rsa", ".txt", ".bak", ".php"]):
+                    port.attack_paths.append(AttackPath("Sensitive Data Exposure", AttackVectorType.CRED_THEFT, "Sensitive file extensions detected in FTP listing.", f"wget -r ftp://{target.ip}", "Wget", "Critical", Priority.MANDATORY_EXPL))
 
-        # --- SECTOR D: WINDOWS CONTEXT SAFETY ---
-        # 1. SMB
-        if port.number in [445, 139] or "smb" in svc or "microsoft-ds" in svc:
-            port.attack_paths.append(AttackPath("SMB Null Session", AttackVectorType.ENUMERATION, "SMB detected. Attempt list shares.", f"smbclient -L //{target.ip} -N", "smbclient", "Medium"))
-            
-            # Strict Windows Check for EternalBlue
-            if target.facts.os_family == "Windows" and any(x in target.facts.os_gen for x in ["7", "2008", "vista"]):
-                port.attack_paths.append(AttackPath("Legacy Windows Exploit (EternalBlue)", AttackVectorType.KNOWN_EXPLOIT, f"Target is Windows {target.facts.os_gen}. High probability of MS17-010.", "use exploit/windows/smb/ms17_010_eternalblue", "Metasploit", "Critical"))
-            
-            if "message_signing: disabled" in f_dump:
-                port.attack_paths.append(AttackPath("SMB NTLM Relay", AttackVectorType.MANIPULATION, "SMB Signing disabled.", "impacket-ntlmrelayx -tf targets.txt -smb2support", "Impacket", "High"))
+        if port.number in [445, 139] or "smb" in svc:
+            port.attack_paths.append(AttackPath("SMB Null Session", AttackVectorType.ENUMERATION, "Attempt list shares.", f"smbclient -L //{target.ip} -N", "smbclient", "Medium", Priority.ENUMERATION))
 
-        # 2. RDP
-        if port.number == 3389 or "rdp" in svc:
-            if target.facts.os_family == "Windows" and any(x in target.facts.os_gen for x in ["7", "2008"]):
-                port.attack_paths.append(AttackPath("BlueKeep Check", AttackVectorType.RCE, "Legacy Windows RDP.", "use exploit/windows/rdp/cve_2019_0708_bluekeep_rce", "Metasploit", "High"))
-            port.attack_paths.append(AttackPath("RDP Credential Spraying", AttackVectorType.CRED_THEFT, "RDP exposed.", f"hydra -L users.txt -p password {target.ip} rdp", "Hydra", "Medium"))
+        if "nfs" in svc or port.number == 2049:
+            port.attack_paths.append(AttackPath("NFS Export Enumeration", AttackVectorType.ENUMERATION, "NFS Service detected.", f"showmount -e {target.ip}", "System Client", "High", Priority.CONFIG_WEAKNESS))
+
+    def _analyze_cross_protocol(self, target: Target):
+        if target.discovered_creds:
+            creds_str = ", ".join(target.discovered_creds)
+            for port in target.ports.values():
+                if port.number == 22:
+                    port.attack_paths.append(AttackPath("Credential Reuse (SSH)", AttackVectorType.CRED_THEFT, f"Try known creds ({creds_str}) on SSH.", "hydra...", "Hydra", "High", Priority.CONFIRMED_VULN))
 
 # --- 4. DEEP PARSER ---
 
@@ -324,19 +322,22 @@ class NmapParser:
         try:
             root = ET.fromstring(xml_content)
             
-            # Host Scripts
+            for extra in root.findall(".//extraports"):
+                if extra.get("state") == "filtered":
+                    count = int(extra.get("count", 0))
+                    target.facts.filtered_ports += count
+
             for script in root.findall(".//hostscript/script"):
                 sid = script.get("id", "")
                 output = script.get("output", "").strip()
                 if "smb" in sid or "nbstat" in sid:
-                    self._attach_to_port(target, [445, 139], sid, output, FindingCategory.SYSTEM)
+                    self._attach_to_port(target, [445, 139], sid, output, "SYSTEM")
                     if "os-discovery" in sid: self._extract_os_facts(output, target)
                 elif "rdp" in sid:
-                    self._attach_to_port(target, [3389], sid, output, FindingCategory.SYSTEM)
+                    self._attach_to_port(target, [3389], sid, output, "SYSTEM")
                 elif "clock" in sid:
                     target.facts.clock_skew = output.splitlines()[0] if output else "Unknown"
 
-            # Ports
             for port_elem in root.findall(".//port"):
                 pid = int(port_elem.get("portid"))
                 if pid not in target.ports: continue
@@ -354,7 +355,7 @@ class NmapParser:
                 full_ver = f"{port.service.product} {port.service.version}".strip()
                 for bad_ver, (cve, desc) in self.BAD_VERSIONS.items():
                     if bad_ver in full_ver:
-                        port.findings.append(Finding(f"{cve} (Version Match)", FindingCategory.VULN, Severity.CRITICAL, desc))
+                        port.findings.append(Finding(f"{cve} (Version Match)", "VULN", Severity.CRITICAL, desc))
 
                 for script in port_elem.findall("script") + port_elem.findall("service/script"):
                     sid = script.get("id", "")
@@ -363,7 +364,7 @@ class NmapParser:
 
         except ET.ParseError: pass
 
-    def _attach_to_port(self, target: Target, port_list: List[int], title: str, output: str, cat: FindingCategory):
+    def _attach_to_port(self, target: Target, port_list: List[int], title: str, output: str, cat: str):
         for pid in port_list:
             if pid in target.ports:
                 target.ports[pid].findings.append(Finding(title, cat, Severity.INFO, output))
@@ -373,10 +374,9 @@ class NmapParser:
             line = line.strip()
             if line.startswith("OS:"):
                 target.facts.os_family = "Windows"
-                # CLEANUP: Fix "Windows Windows 7" duplication logic
                 raw_gen = line.replace("OS:", "").strip()
                 if raw_gen.lower().startswith("windows"): 
-                    raw_gen = raw_gen[7:].strip() # remove first 'Windows'
+                    raw_gen = raw_gen[7:].strip()
                 target.facts.os_gen = raw_gen
             elif line.startswith("Computer name:"):
                 target.facts.hostname = line.replace("Computer name:", "").strip()
@@ -386,13 +386,13 @@ class NmapParser:
                 target.facts.domain = line.replace("Domain name:", "").strip()
 
     def _create_finding(self, port: Port, title: str, output: str):
-        category = FindingCategory.ENUM
+        category = "ENUM"
         severity = Severity.INFO
         t_lower = title.lower()
         o_upper = output.upper()
 
         if "vuln" in t_lower or "cve-" in t_lower:
-            category = FindingCategory.VULN
+            category = "VULN"
             severity = Severity.HIGH
             if "vulners" in t_lower:
                 lines = output.splitlines()
@@ -400,10 +400,10 @@ class NmapParser:
                 output = "\n".join(filtered[:5]) if filtered else output[:200]
             if "VULNERABLE" in o_upper: severity = Severity.CRITICAL
         elif "ftp-anon" in t_lower and "ALLOWED" in o_upper:
-            category = FindingCategory.AUTH
+            category = "AUTH"
             severity = Severity.CRITICAL
         elif "smb-security-mode" in t_lower:
-            category = FindingCategory.CONFIG
+            category = "CONFIG"
             severity = Severity.MEDIUM if "DISABLED" in o_upper else Severity.INFO
 
         port.findings.append(Finding(title, category, severity, output))
@@ -466,7 +466,7 @@ class Scanner:
         except Exception as e:
             return f"ERROR: {str(e)}"
 
-# --- 6. REPORTER ---
+# --- 6. REPORTER (Classic Table) ---
 
 class Reporter:
     def __init__(self):
@@ -476,7 +476,9 @@ class Reporter:
 
     def print_system_intelligence(self, target: Target):
         facts = target.facts
-        if not facts.os_family and not facts.hostname: return
+        firewall_msg = ""
+        if facts.filtered_ports > 100:
+            firewall_msg = f"\n[bold red]⚠️  FIREWALL DETECTED:[/bold red] {facts.filtered_ports} filtered ports found."
 
         grid = Table.grid(padding=1)
         grid.add_column(style="cyan", justify="right")
@@ -487,9 +489,9 @@ class Reporter:
         if facts.workgroup: grid.add_row("Workgroup:", facts.workgroup)
         if facts.domain: grid.add_row("Domain:", facts.domain)
         if facts.is_dc: grid.add_row("Role:", "[bold red]DOMAIN CONTROLLER[/bold red]")
-        if facts.clock_skew: grid.add_row("Clock Skew:", facts.clock_skew)
         
         self.console.print(Panel(grid, title="[bold blue]📜 SYSTEM INTELLIGENCE[/bold blue]", border_style="blue", expand=False))
+        if firewall_msg: self.console.print(firewall_msg)
         self.console.print("")
 
     def print_port(self, port: Port):
@@ -512,14 +514,21 @@ class Reporter:
             if port.attack_paths:
                 v_branch = root.add("[bold yellow]⚔️ ATTACK VECTORS[/bold yellow]")
                 for path in port.attack_paths:
-                    self.attack_vectors.append((port.number, path))
-                    v_branch.add(f"[yellow]{path.title}[/yellow] -> [italic white]{path.command}[/italic white]")
+                    if (port.number, path) not in self.attack_vectors:
+                        self.attack_vectors.append((port.number, path))
+                    # Distinguish between Nmap automated suggestions and Manual ideas
+                    if path.command.startswith("nmap"):
+                        v_branch.add(f"[cyan]Suggested Deep Nmap Scan:[/cyan] [white]{path.title}[/white]")
+                    else:
+                        v_branch.add(f"[yellow]{path.title}[/yellow] -> [italic white]{path.command}[/italic white]")
 
             self.console.print(Panel(root, border_style="blue", expand=False))
             self.console.print("")
 
     def print_summary(self):
         if not self.attack_vectors: return
+        sorted_vectors = sorted(self.attack_vectors, key=lambda x: x[0])
+
         self.console.print("\n[bold yellow]=== 🧭 ATTACK PATH SYNTHESIS ===[/bold yellow]")
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Port", style="cyan")
@@ -527,8 +536,14 @@ class Reporter:
         table.add_column("Vector", style="white")
         table.add_column("Rationale", style="dim white")
         
-        for p, path in self.attack_vectors:
+        seen_vectors = set()
+        for p, path in sorted_vectors:
+            unique_key = (p, path.title)
+            if unique_key in seen_vectors: continue
+            seen_vectors.add(unique_key)
+
             c_style = "red" if path.confidence == "Critical" else "green"
+            if path.confidence == "High": c_style = "yellow"
             table.add_row(str(p), f"[{c_style}]{path.confidence}[/{c_style}]", path.title, path.rationale)
         self.console.print(table)
         self.console.print("")
@@ -542,7 +557,7 @@ class Reporter:
         with open(json_file, "w") as f: json.dump(data, f, indent=4, default=str)
 
         with open(txt_file, "w") as f:
-            f.write(f"Foolish Scan v2.3 Report - Target: {target.ip}\n")
+            f.write(f"Foolish Scan v5.2 Report - Target: {target.ip}\n")
             f.write(f"OS: {target.facts.os_family} {target.facts.os_gen}\n")
             f.write("="*50 + "\n\n")
             for pid, port in target.ports.items():
@@ -557,10 +572,113 @@ class Reporter:
                 f.write("\n" + "-"*30 + "\n\n")
         self.console.print(f"[bold green][✓] Reports saved: {json_file}, {txt_file}[/bold green]")
 
+    def get_attack_vectors(self):
+        return sorted(self.attack_vectors, key=lambda x: x[0])
+
+# --- 7. INTERACTIVE MENU ---
+
+class TimeEstimator:
+    @staticmethod
+    def estimate(cmd: str) -> str:
+        cmd = cmd.lower()
+        if "nmap" in cmd and "script" in cmd: return "~2-5 mins"
+        return "Unknown"
+
+class InteractiveMenu:
+    def __init__(self, console: Console, attack_vectors: List[Tuple[int, AttackPath]], target_obj: Target, parser: NmapParser, reporter: Reporter):
+        self.console = console
+        self.vectors = attack_vectors
+        self.target = target_obj
+        self.parser = parser
+        self.reporter = reporter
+
+    def run(self):
+        if not self.vectors: return
+
+        # Filter strictly for Nmap commands
+        runnable_options = []
+        seen = set()
+        for idx, (port, path) in enumerate(self.vectors):
+            if path.command.startswith("nmap"):
+                if (port, path.title) not in seen:
+                    runnable_options.append((port, path))
+                    seen.add((port, path.title))
+
+        if not runnable_options:
+            return
+
+        while True:
+            self.console.print("\n[bold yellow]=== 🧭 NMAP INTELLIGENCE ESCALATION ===[/bold yellow]")
+            self.console.print("[dim]Select an optional Nmap deep scan to gather more information.[/dim]\n")
+            
+            for i, (port, path) in enumerate(runnable_options):
+                cmd = path.command
+                idx_str = f"[bold cyan][{i + 1}][/bold cyan]"
+                time_est = f"[dim]({TimeEstimator.estimate(cmd)})[/dim]"
+                
+                self.console.print(f"{idx_str} Port {port}: [bold white]{path.title}[/bold white] {time_est}")
+                self.console.print(f"    └── Cmd: [green]{cmd}[/green]")
+
+            self.console.print("\n[bold cyan][Enter][/bold cyan] Exit without running additional scans")
+            
+            choice = Prompt.ask("\n[?] Select option(s) to execute (e.g. 1, 3) or [Enter] to exit", default="").strip().lower()
+            
+            if choice == "" or choice == 'e':
+                break
+            
+            self.console.print(f"[>] You selected: {choice}")
+
+            # Parse selections
+            selections = [s.strip() for s in re.split(r'[,\s]+', choice) if s.strip().isdigit()]
+            
+            for sel in selections:
+                sel_idx = int(sel)
+                if 1 <= sel_idx <= len(runnable_options):
+                    port_num, path = runnable_options[sel_idx - 1]
+                    target_cmd = path.command
+                    
+                    self.console.print(f"\n[bold green][*] Launching Deep Scan on Port {port_num}...[/bold green]")
+                    
+                    # [UI UPDATE] Capture XML instead of showing raw output
+                    try:
+                        # Ensure we request XML output
+                        parts = shlex.split(target_cmd)
+                        # Remove existing -oX or output files if present to avoid conflict (naive check)
+                        if "-oX" not in parts:
+                            parts.extend(["-oX", "-"])
+                        
+                        process = subprocess.Popen(parts, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        
+                        with Progress(
+                            SpinnerColumn(),
+                            TextColumn("[progress.description]{task.description}"),
+                            TimeElapsedColumn(),
+                            console=self.console
+                        ) as progress:
+                            task = progress.add_task(f"[cyan]Scanning Port {port_num}...[/cyan]", total=None)
+                            stdout, stderr = process.communicate()
+                        
+                        if stdout and "<?xml" in stdout:
+                            # Reprocess the output
+                            self.parser.parse(stdout, self.target, is_partial=False)
+                            # Reprint the specific port panel with new findings
+                            self.console.print(f"\n[bold green][✓] Updated Intelligence for Port {port_num}:[/bold green]")
+                            self.reporter.print_port(self.target.ports[port_num])
+                        else:
+                            self.console.print(f"[yellow][!] No structured data returned. Raw Output:[/yellow]\n{stdout}")
+                            if stderr: self.console.print(f"[red]{stderr}[/red]")
+
+                    except Exception as e:
+                        self.console.print(f"[red][!] Execution failed: {e}[/red]")
+                    
+                    Prompt.ask("\nPress Enter to return to menu...")
+                else:
+                    self.console.print(f"[red][!] Invalid option: {sel}[/red]")
+
 # --- MAIN ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Foolish Scan v2.3 (Final Gold Master)")
+    parser = argparse.ArgumentParser(description="Foolish Scan v5.2 (Integrated Edition)")
     parser.add_argument("target", help="Target IP")
     parser.add_argument("--mode", choices=["fast", "ctf"], default="ctf")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
@@ -571,7 +689,7 @@ def main():
         sys.exit(1)
 
     console = Console()
-    console.print(f"[bold green][*] Starting Foolish Scan v2.3 against {args.target}[/bold green]")
+    console.print(f"[bold green][*] Starting Foolish Scan v5.2 against {args.target}[/bold green]")
 
     engine = TaskEngine(args.mode)
     scanner = Scanner(args.target, engine, args.concurrency)
@@ -581,6 +699,7 @@ def main():
     reporter = Reporter()
     target_obj = Target(args.target)
 
+    # Phase 1: Discovery
     with console.status("[bold blue]Phase 1: Discovery Scan...[/bold blue]"):
         discovered = scanner.scan_discovery()
 
@@ -595,20 +714,35 @@ def main():
         port = target_obj.add_port(p)
         if s != "unknown": port.service.name = s
 
+    # Phase 2: Deep Scan
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            future_to_port = {executor.submit(scanner.scan_port, target_obj.ports[p]): target_obj.ports[p] for p, s in discovered}
-            for future in concurrent.futures.as_completed(future_to_port):
-                port = future_to_port[future]
-                try:
-                    xml_data = future.result()
-                    is_partial = "fail_safe" in str(xml_data).lower()
-                    xml_parser.parse(xml_data, target_obj, is_partial)
-                except Exception as e:
-                    console.print(f"[red][!] Logic Error Port {port.number}: {e}[/red]")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total} Ports"),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            
+            task_id = progress.add_task("[cyan]Deep Scanning Ports...[/cyan]", total=len(discovered))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                future_to_port = {executor.submit(scanner.scan_port, target_obj.ports[p]): target_obj.ports[p] for p, s in discovered}
+                
+                for future in concurrent.futures.as_completed(future_to_port):
+                    port = future_to_port[future]
+                    try:
+                        progress.update(task_id, advance=1, description=f"[cyan]Deep Scanning... (Finished Port {port.number})[/cyan]")
+                        xml_data = future.result()
+                        is_partial = "fail_safe" in str(xml_data).lower()
+                        xml_parser.parse(xml_data, target_obj, is_partial)
+                    except Exception as e:
+                        console.print(f"[red][!] Logic Error Port {port.number}: {e}[/red]")
     except KeyboardInterrupt:
         sys.exit(1)
 
+    # Phase 3: Logic & Reporting
     normalizer.normalize(target_obj)
     inference.analyze(target_obj)
 
@@ -618,7 +752,15 @@ def main():
     
     reporter.print_summary()
     
-    # FIX: Clean [y/N] prompt
+    # Phase 4: Interactive Escalation (New v5.2 Feature - UI Integrated)
+    vectors = reporter.get_attack_vectors()
+    if vectors:
+        # Pass dependencies to menu so it can parse/print results
+        menu = InteractiveMenu(console, vectors, target_obj, xml_parser, reporter)
+        menu.run()
+
+    console.print("")
+
     if Confirm.ask("[?] Do you want to save the report?(y/N)", default=False, show_default=False,   show_choices=False):
         reporter.save_report(target_obj)
     
