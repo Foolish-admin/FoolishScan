@@ -144,7 +144,3 @@ This tool is intended for use in:
 3. Private Home Labs.
 
 Do not use this tool against targets you do not have explicit permission to test.
-
-```
-
-```
